@@ -1,10 +1,12 @@
 import json
 import random
+import re
 
 from flask import Flask, render_template, request
 import os.path
 import time
 
+import asyncpg
 app = Flask(__name__)
 
 with open("config.json", 'r') as config_file:
@@ -12,9 +14,18 @@ with open("config.json", 'r') as config_file:
 
 def _selectRepeatWords(words : list):
 
-    words = sorted(words, key=lambda x: x["nextRepeatTime"])[:config['WordsPerTry']]
-    return list(filter(lambda x: x['nextRepeatTime'] < int(time.time()), words))
+    random.shuffle(words)
+    filtered_words = list(filter(lambda x: x['nextRepeatTime'] < int(time.time()), words))
 
+    words2repeat = []
+    for word in filtered_words:
+        for w2r in words2repeat:
+            if w2r['word'] == word['word']: break
+        else:
+            words2repeat.append(word)
+        if len(words2repeat) == config['WordsPerTry']:
+            return words2repeat
+    return words2repeat
 
 
 def _generateFirstStage(words, words2repeat):
@@ -26,7 +37,20 @@ def _generateFirstStage(words, words2repeat):
 
     stage1 = []
     for w in words2repeat:
-        options = random.sample(words, 3)
+
+        options = []
+        if "partOfSpeech" in w:
+            wordsWithSamePartOfSpeech = list(filter(lambda x: "partOfSpeech" in x and x["partOfSpeech"] == w["partOfSpeech"], words))
+            if (w["partOfSpeech"] == "v"
+                or w["partOfSpeech"] == "n"
+                or  w["partOfSpeech"] == "adj"
+                or w["partOfSpeech"] == "adv") and len(wordsWithSamePartOfSpeech) >= 3:
+                options = random.sample(wordsWithSamePartOfSpeech, 3)
+            else:
+                options = random.sample(words, 3)
+        else:
+            options = random.sample(words, 3)
+
         insert_index = random.randint(0, 3)
 
         options.insert(insert_index, w)
@@ -59,7 +83,10 @@ def _loadDatabase():
 
 def _updateWordsInDatabaseAndSave(words2update, words):
     for word in words2update:
-        val = words2update[word]
+        val = "someval"
+        if type(words2update) == dict:
+            val = words2update[word]
+
         if type(val) == bool:
             # сохранение результата из повторения
 
@@ -75,12 +102,14 @@ def _updateWordsInDatabaseAndSave(words2update, words):
                     wordDb["nextRepeatTime"] = _getRepeatDateFromRepeatIndex(wordDb["repeatIndex"])
                     break
 
-        elif type(val) == str:
+        else:
             words.append({
                 "repeatIndex": 0,
-                "translation": val,
-                "word": word,
-                "nextRepeatTime": 0
+                "translation": word["translation"],
+                "word": word["word"],
+                "nextRepeatTime": 0,
+                "example": word["example"],
+                "partOfSpeech": word["partOfSpeech"].replace(".", "")
             })
     with open("database.json", "w", encoding="utf-8") as f:
         f.write(json.dumps(words, indent=4))
@@ -110,7 +139,7 @@ def _getRepeatDateFromRepeatIndex(repeatIndex):
 
 
 def _checkInput(words):
-    words_to_add = dict()
+    words_to_add = list()
     any_word_added = False
 
     if not os.path.isfile("database.json"):
@@ -123,20 +152,31 @@ def _checkInput(words):
                 continue
 
             word = splitted[0]
+
+            partOfSpeech = ""
+            partOfSpeechMatch = re.search(r'\([A-Za-z]+\)', word)
+            if partOfSpeechMatch:
+                partOfSpeech = partOfSpeechMatch.group()
+                word = word.replace(partOfSpeech, "")
+                partOfSpeech = partOfSpeech.replace("(", "").replace(")", "")
+
+
             word = word.strip()
             word = word.lower()
-            translation = splitted[1]
-            hint = ""
+            transAndExample = splitted[1].split(";")
 
-            for ww in words:
-                if ww['word'] == word:
-                    ww['translation'] = ww['translation'] + ", " + translation
-                    break
+            translation = transAndExample[0]
+            if len(transAndExample) > 1:
+                example = transAndExample[1:]
             else:
-                if len(splitted) == 3:
-                    hint = splitted[2]
+                example = []
 
-                words_to_add[word] = translation
+            words_to_add.append({
+                "word": word,
+                "translation": translation,
+                "example": example,
+                "partOfSpeech": partOfSpeech
+            })
             any_word_added = True
 
     with open("input.txt", "w", encoding="utf-8") as f:
