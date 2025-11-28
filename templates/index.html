@@ -47,11 +47,18 @@
     let currentStage = 1;
 
     //stage1
+
+
+     {#${stage1Word['word']['example'] ? stage1Word['word']['example'].map((example) => {#}
+     {#               return `<p style="color: gray; font-size: 0.75em; text-align: center">${example}</p>`#}
+     {#   }).join('') : ''}#}
     function stage1NextStep(stage1Word, index) {
         let firstStageHtml = `
             <div>
 
                 <h2 style="display: flex; justify-content: center" >${stage1Word['translated']}</h2>
+
+
                 <div class="row">
                         ${stage1Word['options'].map((v, i, a) => {
             return `<div class="col-6"> <button onclick="workStage1Step(${index}, ${stage1Word['word']['word'] === v['word']})" style="width: 100%"  class="btn btn-light mb-2">
@@ -66,24 +73,26 @@
         dataContainer.html(firstStageHtml)
     }
 
-    function workStage1Step(curIndex, isCorrect) {
+    async function workStage1Step(curIndex, isCorrect) {
         let word = jsonData.firstStage[curIndex];
 
-        if (!(word['word']['word'] in resultState) || word['word']['word'] in resultState && resultState[word['word']['word']] === true) {
-            resultState[word['word']['word']] = isCorrect;
+        if (!(word['word']['wordId'] in resultState) || word['word']['wordId'] in resultState && resultState[word['word']['wordId']] === true) {
+            resultState[word['word']['wordId']] = isCorrect;
         }
 
 
         if (!isCorrect) {
             jsonData.firstStage.push(word);
             alert("Неверно")
+        } else {
+            await stage2PlayWord(word['word']['word'])
         }
-
         if (curIndex < jsonData.firstStage.length - 1) {
             stage1NextStep(jsonData.firstStage[curIndex + 1], curIndex + 1)
         } else {
             stage2NextStep();
         }
+
     }
 
     function stage2NextStep() {
@@ -125,7 +134,7 @@
                 </div>
             <div class="form-group">
                 <label for="stage2Input">Введите прозвучавшее слово</label>
-                <input autofocus onkeydown="workStage2Step(event, '${word['word']}', ${index})" type="text" class="form-control" id="stage2Input">
+                <input autofocus onkeydown="workStage2Step(event, '${word['word']}', ${index}, ${word['wordId']})" type="text" class="form-control" id="stage2Input">
             </div>
 
             </div>
@@ -136,7 +145,7 @@
         document.getElementById('stage2Input').focus();
     }
 
-    function workStage2Step(event, rightVal, index) {
+    function workStage2Step(event, rightVal, index, wordId) {
         if (event.key !== 'Enter') {
             return;
         }
@@ -146,7 +155,7 @@
         let val = $('#stage2Input').val();
         if (val !== rightVal) {
             alert("Неверно! Должно быть " + rightVal)
-            resultState[rightVal] = false;
+            resultState[wordId] = false;
             stage2State.errors.add(index);
         }
         stage2NextStep();
@@ -158,6 +167,12 @@
         const utterance = new SpeechSynthesisUtterance(word);
         utterance.lang = 'en-US'; // Set language to English
         speechSynthesis.speak(utterance);
+
+        return new Promise((resolve) => {
+            setTimeout(() => {
+                resolve();
+            }, 1000)
+        })
     }
 
     function stage3NextStep() {
@@ -197,7 +212,7 @@
                 </div>
             <div class="form-group">
                 <label for="stage3Input">Введите на английском</label>
-                <input autofocus onkeydown="workStage3Step(event, '${word['word']}', ${index})" type="text" class="form-control" id="stage3Input">
+                <input autofocus onkeydown="workStage3Step(event, '${word['word']}', ${index}, ${word['wordId']})" type="text" class="form-control" id="stage3Input">
             </div>
 
             </div>
@@ -208,7 +223,7 @@
         document.getElementById('stage3Input').focus();
     }
 
-    function workStage3Step(event, rightVal, index) {
+    async function workStage3Step(event, rightVal, index, wordId) {
         if (event.key !== 'Enter') {
             return;
         }
@@ -218,8 +233,10 @@
         let val = $('#stage3Input').val();
         if (val !== rightVal) {
             alert("Неверно! Должно быть " + rightVal)
-            resultState[rightVal] = false;
+            resultState[wordId] = false;
             stage3State.errors.add(index);
+        } else {
+            await stage2PlayWord(rightVal)
         }
         stage3NextStep();
     }

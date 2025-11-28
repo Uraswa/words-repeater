@@ -1,3 +1,4 @@
+import datetime
 import json
 import random
 import re
@@ -5,9 +6,11 @@ import re
 from flask import Flask, render_template, request
 import os.path
 import time
+from flask_cors import CORS, cross_origin
 
 import asyncpg
 app = Flask(__name__)
+cors = CORS(app) # allow CORS for all domains on all routes.
 
 with open("config.json", 'r') as config_file:
     config = json.loads(config_file.read())
@@ -15,7 +18,7 @@ with open("config.json", 'r') as config_file:
 def _selectRepeatWords(words : list):
 
     random.shuffle(words)
-    filtered_words = list(filter(lambda x: x['nextRepeatTime'] < int(time.time()), words))
+    filtered_words = list(filter(lambda x: x['nextRepeatTime'] < datetime.datetime.now(), words))
 
     words2repeat = []
     for word in filtered_words:
@@ -31,6 +34,12 @@ def _selectRepeatWords(words : list):
 def _generateFirstStage(words, words2repeat):
     wordsrepeat = [w["word"] for w in words2repeat]
     words = list(filter(lambda x: x["word"] not in wordsrepeat, words))
+
+    for w in words:
+        w['nextRepeatTime'] = 0
+
+    for w in words2repeat:
+        w['nextRepeatTime'] = 0
 
     if len(words) == 0 or len(words2repeat) == 0:
         return []
@@ -75,13 +84,55 @@ def _createDatabase():
     f.close()
 
 
-def _loadDatabase():
-    with open("database.json", "r", encoding="utf-8") as f:
-        words = json.loads(f.read())
+async def _loadDatabase():
+    """
+    Асинхронная загрузка данных с использованием asyncpg
+    """
+    try:
+        # Подключение к базе данных
+        conn = await asyncpg.connect(
+            database="English",
+            user="nice",
+            password="nice",
+            host="localhost",
+            port=5432
+        )
+
+        # Выполнение запроса
+        rows = await conn.fetch("SELECT * FROM words")
+
+        # Преобразование в список словарей
+        words = []
+        for row in rows:
+            wordDict = dict(row)
+            words.append({
+                "wordId": wordDict["word_id"],
+                "nextRepeatTime": wordDict["nextrepeattime"],
+                "repeatIndex": wordDict["repeatindex"],
+                "word": wordDict["word"],
+                "translation": wordDict["translation"],
+                "example": json.loads(wordDict["example"]) if wordDict["example"] else None,
+                "partOfSpeech": wordDict["partofspeech"],
+                "weight": wordDict["weight"]
+            })
+
+        await conn.close()
         return words
 
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return []
 
-def _updateWordsInDatabaseAndSave(words2update, words):
+
+async def _updateWordsInDatabaseAndSave(words2update, wordsInDatabase, doNotChangeRepeatTimes = False, doNotIncreaseRepeatIndex = False):
+    conn = await asyncpg.connect(
+        database="English",
+        user="nice",
+        password="nice",
+        host="localhost",
+        port=5432
+    )
+
     for word in words2update:
         val = "someval"
         if type(words2update) == dict:
@@ -90,20 +141,40 @@ def _updateWordsInDatabaseAndSave(words2update, words):
         if type(val) == bool:
             # сохранение результата из повторения
 
-            for w in words:
-                if w["word"] == word:
+            for w in wordsInDatabase:
+                if w["wordId"] == int(word):
                     wordDb = w
 
-                    if not val:
+                    # Обновление веса в зависимости от результата
+                    if not val:  # Неудача
                         wordDb["repeatIndex"] = 1
-                    else:
-                        wordDb["repeatIndex"] = int(wordDb["repeatIndex"]) + 1
+                        wordDb["weight"] = min(
+                            1 + wordDb.get("weight", config['text_generation']['default_weight']) *
+                            config['text_generation']['weight_increase_fail'],
+                            config['text_generation']['max_weight']
+                        )
+                    else:  # Успех
+                        if not doNotIncreaseRepeatIndex:
+                            wordDb["repeatIndex"] = int(wordDb["repeatIndex"]) + 1
+                        wordDb["weight"] = max(
+                            wordDb.get("weight", config['text_generation']['default_weight']) *
+                            config['text_generation']['weight_decrease_success'],
+                            config['text_generation']['min_weight'])
 
-                    wordDb["nextRepeatTime"] = _getRepeatDateFromRepeatIndex(wordDb["repeatIndex"])
+                    if not doNotChangeRepeatTimes:
+                        wordDb["nextRepeatTime"] = _getRepeatDateFromRepeatIndex(wordDb["repeatIndex"])
+                    await conn.fetchval(
+                        "UPDATE words SET repeatindex=$1, nextrepeattime=$2 WHERE word_id=$3",
+                        wordDb["repeatIndex"], wordDb["nextRepeatTime"], wordDb["wordId"])
+
+                    await conn.fetchval(
+                        "INSERT INTO words_history (word_id, repeatindex, repeatdate) VALUES ($1, $2, NOW())",
+                        wordDb["wordId"], wordDb["repeatIndex"])
+
                     break
 
         else:
-            words.append({
+            wordsInDatabase.append({
                 "repeatIndex": 0,
                 "translation": word["translation"],
                 "word": word["word"],
@@ -111,8 +182,10 @@ def _updateWordsInDatabaseAndSave(words2update, words):
                 "example": word["example"],
                 "partOfSpeech": word["partOfSpeech"].replace(".", "")
             })
-    with open("database.json", "w", encoding="utf-8") as f:
-        f.write(json.dumps(words, indent=4))
+
+            await conn.fetchval("INSERT INTO words (translation, partofspeech, word, example, nextrepeattime) VALUES ($1, $2, $3, $4, NOW())", word["translation"], word["partOfSpeech"], word["word"], word["example"])
+
+    await conn.close()
 
 
 def _getRepeatDateFromRepeatIndex(repeatIndex):
@@ -132,10 +205,12 @@ def _getRepeatDateFromRepeatIndex(repeatIndex):
     else:
         days = 14
 
-    current_time = int(time.time())
-    current_time += days * 86400
+    # Получаем текущую дату и время
+    current_date = datetime.datetime.now()
+    # Добавляем нужное количество дней
+    repeat_date = current_date + datetime.timedelta(days=days)
 
-    return current_time
+    return repeat_date
 
 
 def _checkInput(words):
@@ -186,15 +261,20 @@ def _checkInput(words):
         _updateWordsInDatabaseAndSave(words_to_add, words)
 
 
-@app.route('/', methods=['POST', 'GET'])
-def hello_world():  # put application's code here
+@app.route('/repeatWords', methods=['POST', 'GET'])
+async def repeatWords():  # put application's code here
 
     _checkDatabase()
-    words = _loadDatabase()
+    words = await _loadDatabase()
 
     if request.method == 'POST':
         json_data = json.loads(request.get_data().decode('utf-8'))
-        _updateWordsInDatabaseAndSave(json_data, words)
+        await _updateWordsInDatabaseAndSave(
+            json_data["resultState"],
+            words,
+            json_data["decreaseRepeatIndexOnly"] if "decreaseRepeatIndexOnly" in json_data else False,
+            json_data["decreaseRepeatIndexOnly"] if "decreaseRepeatIndexOnly" in json_data else False
+        )
 
         return json.dumps({"success": True})
 
@@ -204,10 +284,121 @@ def hello_world():  # put application's code here
 
     firstStage = _generateFirstStage(words, words2repeat)
 
-    return render_template("index.html", data={
+    return json.dumps({
         "firstStage": firstStage,
         "words": words2repeat
     })
+
+@app.route('/generate_text', methods=['POST', 'GET'])
+async def generate_text():  # put application's code here
+
+    _checkDatabase()
+    words = await _loadDatabase()
+
+    """
+        Генерирует текст с использованием изучаемых слов через DeepSeek API
+        """
+    # Выбираем слова с наибольшим весом
+
+    from openai import OpenAI
+
+    config = dict()
+    with open("config.json") as f:
+        config = json.loads(f.read())
+
+    weights = []
+    ids = set()
+    for w in words:
+        ids.add(w['wordId'])
+        weights.append(w.get('weight', 1.0))
+
+    selected_words = random.choices(words, weights, k=20)
+
+    EXACT_MEANING = False
+
+    def returnWordString(w):
+        res = ''
+        res += w['word'] + "|"
+        if EXACT_MEANING:
+            res += w['translation'] + "|"
+        res += str(w['wordId'])
+        return res
+
+    top_words = [returnWordString(w) for w in selected_words]
+
+    if not top_words:
+        return "Недостаточно слов для генерации текста."
+
+    words_formated = ",\n".join(top_words)
+    prompt = f"""
+    Сгенерируй осмысленный и интересный текст на английском языке длиной около 200-250 слов, чтобы использовать его в качестве тестового задания, где студенту нужно вставить на место пропуска слово из списка вариантов.
+    Тема текста может быть любой: рассказ, статья, описание и т.д.
+    Текст должен естественным образом включать минимум 10, максимум 15 случайных слов из следующего списка:\n{words_formated}.
+    В местах, куда ты вставил слова из списка, сделай вот такой пропуск: ПРОПУСК. Необходимо генерировать текст так, чтобы можно было определить какое слово пропущено. Не должно быть
+    двойственных ситуаций, когда невозможно точно определить какое слово пропущно.
+    Каждое слово состоит из след. составляющих: само слово|{'какое значение имеет слово|' if EXACT_MEANING else ''}идентефикатор слова. 
+    {'Если слово в английском языке имеет несколько значений, то желательно, чтобы в тексте смысл слова был таким же, либо похожим на значение указанное у этого слова в списке слов.' if EXACT_MEANING else ''}
+    Текст должен быть на уровне intermediate английского, грамматически правильным и связным.
+    Ответ верни как валидный JSON,чтобы его можно было распарсить без всяких манипуляций. НИКАКОГО СЛОВА JSON, символов ` в начале текста быть не должно!!!! Только валидный json объект такого с такими полями:
+    "Header": Заголовок(string)
+    "Text": Текст(string),
+    "Identifiers": массив идентефикаторов слов, которые ты вставил в текст из списка, в порядке их вставки(int[])  
+    больше в ответе ничего лишнего быть не должно!
+    идентефикаторов слов, которые ты вставил в текст из списка, в порядке их вставки, в формате identifier;identifier; больше в ответе ничего лишнего быть не должно!,
+    "RightAnswers": "Массив правильных ответов в порядке, в котором они встречаются в тексте. Слова должны быть в том же виде, что они встречаются в тексте (например, если слово в тексте в прошедшем, то здесь оно тоже должно быть в прошедшем)" string[]
+    """
+
+    print("Prompt:", prompt)
+
+    client = OpenAI(api_key='sk-417c2dc785a7445e93c0e9c0d33c1ac3', base_url="https://api.deepseek.com")
+
+    response = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system",
+             "content": "Ты опытный преподаватель английского языка, поэтому ищешь индивидуальный подход к каждому ученику, анализируя его сильные и слабые стороны, предлагаешь такие задание, чтобы изучение английского шло максимально эффективно."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=config['text_generation']['max_length'],
+        temperature=config['text_generation']['temperature'],
+        stream=False
+    )
+
+    content = response.choices[0].message.content
+    parsed = json.loads(content)
+
+    text = parsed['Text']
+    regex = r"\*\w+\*"
+    matches = re.findall(regex, text)
+
+    print(matches)
+    wordsInText = []
+
+
+    for m in matches:
+        text = text.replace(m, '<>')
+        wordsInText.append(m.replace('*', ''))
+
+    index = 0
+    for idn in parsed['Identifiers']:
+        if idn not in ids:
+            print(f"Слово {idn} не найдено.")
+
+    parsed['words'] = wordsInText
+    parsed['text'] = text
+#     text = """The Hidden Cost of Progress
+#
+# In our modern world, the rapid *acquisition*;29 of new technologies and the constant *accumulation*;25 of material goods
+# have become the norm. While this progress offers an *abundance*;14 of conveniences, it also presents an *acute*;30
+# challenge to our environment. We must *adequately*;5 address the *adverse*;39 effects of our consumption. The
+# *absence*;9 of *adequate*;4 environmental policies in many regions means that pollution continues to *accumulate*;23 in
+# our air and water. It is crucial that we *adhere*;32 to sustainable principles and hold corporations *accountable*;21
+# for their ecological impact. The *adoption*;41 of greener practices is no longer a choice but a necessity. We cannot
+# remain *absent*;11 from this global conversation. Our natural world seems to *absorb*;13 our neglect, but there is a
+# limit. We must act *accordingly*;18, ensuring that our pursuit of progress does not come at the cost of our planet's
+# health."""
+    return parsed
+
 
 
 if __name__ == '__main__':
